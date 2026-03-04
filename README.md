@@ -277,4 +277,4 @@ Feedback is appended to `FEEDBACK_LOG_PATH` (default `data/feedback.jsonl`).
 
 ## License
 
-No LICENSE file is present in this repository. Add one before making it public (e.g. `MIT`, `Apache-2.0`).
+MIT
