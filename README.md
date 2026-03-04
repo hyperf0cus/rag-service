@@ -1,4 +1,4 @@
-# rag-service
+# Production-style RAG service (FastAPI + Qdrant + local LLM)
 
 A production-ready Retrieval-Augmented Generation service built with **FastAPI** and **Qdrant** — no LangChain or LlamaIndex. Every primitive (chunking, embedding, retrieval, prompting, streaming) is implemented explicitly. Documents are ingested with tenant isolation and content-hash deduplication; queries stream back via SSE with bracketed `[S1]/[S2]` source references in the generated text and a structured `citations` event carrying `doc_id`, `chunk_id`, score, and a snippet. Embeddings default to a local sentence-transformers model (no API key required), and `/chat` supports both a local Ollama/Qwen LLM and OpenAI — if the LLM is unavailable the service falls back gracefully to a sources-only response.
 
