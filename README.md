@@ -1,133 +1,121 @@
 # rag-service
 
-A production-grade Retrieval-Augmented Generation (RAG) service built with
-**FastAPI**, **Qdrant**, and **OpenAI**.  No LangChain or LlamaIndex – every
-primitive is implemented explicitly so the code is easy to read, test, and
-extend.
+A production-ready Retrieval-Augmented Generation service built with **FastAPI** and **Qdrant** — no LangChain or LlamaIndex. Every primitive (chunking, embedding, retrieval, prompting, streaming) is implemented explicitly. Documents are ingested with tenant isolation and content-hash deduplication; queries stream back via SSE with bracketed `[S1]/[S2]` source references in the generated text and a structured `citations` event carrying `doc_id`, `chunk_id`, score, and a snippet. Embeddings default to a local sentence-transformers model (no API key required), and `/chat` supports both a local Ollama/Qwen LLM and OpenAI — if the LLM is unavailable the service falls back gracefully to a sources-only response.
 
 ---
 
-## Architecture
+## Features
 
-```
-┌──────────┐  POST /ingest   ┌─────────────────────────────────────────────┐
-│  Client  │ ─────────────►  │  Chunk (tiktoken)  →  Embed (OpenAI)        │
-│          │                 │  →  Upsert to Qdrant (dedup by chunk_hash)   │
-│          │  POST /search   └─────────────────────────────────────────────┘
-│          │ ─────────────►  Embed query → Qdrant ANN search (cosine)
-│          │
-│          │  POST /chat     ┌──────────────────────────────────────────────┐
-│          │ ─────────────►  │  Retrieve chunks → Build grounded prompt     │
-│          │  SSE stream ◄── │  → Stream tokens from OpenAI                 │
-│          │                 │  → Emit final citations event                │
-└──────────┘                 └──────────────────────────────────────────────┘
-```
+- **Two ingest paths:** multipart file upload (`POST /ingest`) and server-side paths (`POST /ingest/paths`).
+- **Deterministic doc IDs:** `doc_id = {tenant_id}_{sha1(file_bytes)[:12]}` — re-ingesting the same bytes returns the same ID regardless of filename or path.
+- **Idempotent ingest:** chunk-level deduplication by `(chunk_hash, tenant_id)`; re-ingesting an unchanged file inserts zero new chunks.
+- **Retrieval debug endpoint:** `POST /search` returns ranked chunks with score, chunk\_id, doc\_id, and content — no LLM call.
+- **SSE streaming chat (`POST /chat`):** tokens buffered into word-sized frames; answer text uses `[S1]`/`[S2]` references; stream always ends with a `citations` event (`doc_id`, `chunk_id`, score, snippet) then `[DONE]`.
+- **LLM fallback:** if the LLM is unreachable (auth error, rate limit, connection refused) the stream emits a human-readable message and real citations instead of a raw error.
+- **Prometheus metrics** at `GET /metrics` — request counts/latencies, retrieval/LLM latencies, token totals, cache hit rate, no-answer events.
+- **Structured JSON logs** with per-request `request_id` and `tenant_id` propagated via context vars.
+- **Evaluation CLI:** recall\@k, hit-rate\@k, MRR against a golden JSONL dataset; reports written to `reports/`.
+- **Fully local option:** `EMBEDDINGS_PROVIDER=local` + `LLM_PROVIDER=ollama` — zero API keys needed end-to-end.
 
 ---
 
-## LLM providers
+## Quickstart (Docker Compose)
 
-| Provider | `LLM_PROVIDER` | Requires | Notes |
-|----------|----------------|----------|-------|
-| Ollama (default for local) | `ollama` | nothing | Fully local; pull model first |
-| OpenAI | `openai` | `OPENAI_API_KEY` | Cloud; billed per token |
-
----
-
-## Local LLM (Ollama + Qwen)
-
-Run `/chat` completely locally — no cloud API keys, no usage fees.
-
-### 1. Start the stack
+**Prerequisites:** Docker ≥ 24, Docker Compose ≥ 2.20. No API key required for the default local stack.
 
 ```bash
-cp .env.example .env          # LLM_PROVIDER=ollama is already set
+cp .env.example .env          # defaults: EMBEDDINGS_PROVIDER=local, LLM_PROVIDER=ollama
 docker compose up --build
 ```
 
-### 2. Pull the model
-
-The Ollama container starts immediately but has no models cached yet.
-Pull Qwen 2.5 7B Instruct (≈ 5 GB):
+After the stack is healthy, **pull the Ollama model** (≈ 5 GB, one-time):
 
 ```bash
 docker exec -it rag-service-ollama-1 ollama pull qwen2.5:7b-instruct
 ```
 
-> **VRAM guidance**
-> | Model | Minimum VRAM | Notes |
-> |-------|-------------|-------|
-> | `qwen2.5:7b-instruct` | 6 GB | Default; good quality/speed balance |
-> | `qwen2.5:3b-instruct` | 3 GB | Faster, lower quality |
-> | `qwen2.5:14b-instruct` | 10 GB | Better reasoning |
->
-> CPU inference works but is slow (~20–60 tok/s on a modern laptop).
-> Uncomment the `deploy.resources` GPU block in `docker-compose.yml` to
-> enable NVIDIA GPU acceleration.
+> CPU inference works without a GPU; expect ≈ 5–20 tok/s depending on hardware.
+> For NVIDIA GPU acceleration, uncomment the `deploy.resources` block in `docker-compose.yml`.
 
-### 3. Ingest and chat
+Running services:
+
+| Service     | Host URL                          |
+|-------------|-----------------------------------|
+| API         | http://localhost:8010             |
+| Qdrant UI   | http://localhost:6333/dashboard   |
+| Prometheus  | http://localhost:9090             |
 
 ```bash
-# Ingest a document (uses local sentence-transformers embeddings)
-curl -X POST http://localhost:8010/ingest \
-  -F "tenant_id=acme" \
-  -F "files=@docs/handbook.txt"
+curl http://localhost:8010/health
+# {"status":"ok","version":"0.1.0","uptime":2.31}
+```
 
-# Stream a chat response (no API key needed)
+---
+
+## Demo in 60 seconds
+
+Run all commands after `docker compose up --build` and the model pull above.
+
+```bash
+# 1. Create demo documents
+mkdir -p data/demo_docs
+
+cat > data/demo_docs/policy.txt << 'EOF'
+Refund policy: full refunds are available within 30 days of purchase.
+Digital products are non-refundable once downloaded.
+EOF
+
+cat > data/demo_docs/faq.txt << 'EOF'
+To reset your password go to Settings > Security > Change Password.
+Contact support@example.com for account-related issues.
+EOF
+
+# 2. Ingest both files
+curl -s -X POST http://localhost:8010/ingest \
+  -F "tenant_id=demo" \
+  -F "files=@data/demo_docs/policy.txt" \
+  -F "files=@data/demo_docs/faq.txt" | python3 -m json.tool
+# {
+#   "doc_ids": ["demo_3a9f12b84c01", "demo_7e2a4108cd99"],
+#   "chunks_ingested": 2, "chunks_skipped": 0, "total_chunks": 2
+# }
+
+# 3. Debug retrieval (no LLM)
+curl -s -X POST http://localhost:8010/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Can I get a refund?", "tenant_id": "demo", "top_k": 3}' \
+  | python3 -m json.tool
+
+# 4. Chat via SSE (streams to terminal)
 curl -N -X POST http://localhost:8010/chat \
   -H "Content-Type: application/json" \
-  -d '{"tenant_id": "acme", "query": "What is the onboarding process?"}'
+  -d '{"query": "What is the refund policy?", "tenant_id": "demo"}'
 ```
 
----
+Expected SSE output shape:
 
-## Embeddings providers
-
-| Provider | `EMBEDDINGS_PROVIDER` | Requires | Vector dim |
-|----------|-----------------------|----------|------------|
-| sentence-transformers (default) | `local` | nothing | 384 (all-MiniLM-L6-v2) |
-| OpenAI Embeddings API | `openai` | `OPENAI_API_KEY` | 1536 (text-embedding-3-small) |
-
-**`/ingest` and `/search` work without any API key when `EMBEDDINGS_PROVIDER=local`.**
-Only `/chat` (the LLM step) still requires `OPENAI_API_KEY`.
-
-> **Note:** the local model (~90 MB) is downloaded from HuggingFace on first
-> use.  Set `HF_HOME` to a Docker volume to avoid re-downloading on every
-> container start.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Docker ≥ 24 and Docker Compose ≥ 2.20
-- An OpenAI API key (**optional** – only needed for `/chat`)
-
-```bash
-# 1. Clone / enter the repo
-cd rag-service
-
-# 2. Configure environment
-cp .env.example .env
-# For ingest + search only, no edits needed (EMBEDDINGS_PROVIDER=local by default).
-# For /chat, also set: OPENAI_API_KEY=sk-...
-
-# 3. Start everything
-docker compose up --build
+```
+data: {"type": "token", "content": "According to [S1], full refunds are available"}
+data: {"type": "token", "content": " within 30 days of purchase."}
+...
+data: {"type": "citations", "citations": [
+  {"rank": 1, "doc_id": "demo_3a9f12b84c01", "chunk_id": "demo_3a9f12b84c01_0000",
+   "score": 0.9241, "snippet": "Refund policy: full refunds are available…"}
+]}
+data: [DONE]
 ```
 
-Services:
-| Service    | URL                      |
-|------------|--------------------------|
-| API        | http://localhost:8000    |
-| Qdrant UI  | http://localhost:6333/dashboard |
-| Prometheus | http://localhost:9090    |
+When no relevant sources exist:
 
-Check the API is running:
+```
+data: {"type": "token", "content": "I don't have enough information in the provided documents to answer this question."}
+data: {"type": "citations", "citations": []}
+data: [DONE]
+```
+
 ```bash
-curl http://localhost:8000/health
-# {"status":"ok","version":"0.1.0","uptime":3.14}
+# 5. Check metrics
+curl -s http://localhost:8010/metrics | grep -E "^rag_retrieval_latency|^rag_ingest_chunks"
 ```
 
 ---
@@ -136,213 +124,18 @@ curl http://localhost:8000/health
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,local]"    # [local] installs sentence-transformers
 
-# Start Qdrant separately
+# Start Qdrant
 docker run -p 6333:6333 qdrant/qdrant:v1.10.0
 
-# Run the API with auto-reload
+# Optional: start Ollama
+docker run -p 11434:11434 ollama/ollama:latest
+
 uvicorn app.main:app --reload --port 8000
 ```
 
----
-
-## Ingest Documents
-
-### Via file upload (multipart/form-data)
-
-```bash
-curl -X POST http://localhost:8000/ingest \
-  -F "tenant_id=acme" \
-  -F 'files=@docs/product_manual.txt' \
-  -F 'files=@docs/faq.md' \
-  -F 'metadata={"source":"confluence","team":"support"}'
-```
-
-Response:
-```json
-{
-  "doc_ids": ["acme_a1b2c3d4e5f6", "acme_7g8h9i0j1k2l"],
-  "chunks_ingested": 47,
-  "chunks_skipped": 0,
-  "total_chunks": 47
-}
-```
-
-### Via server-side paths (JSON body)
-
-Useful when documents are already on the server (e.g. mounted volume):
-
-```bash
-curl -X POST http://localhost:8000/ingest/paths \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "acme",
-    "paths": ["/app/data/docs/manual.txt"],
-    "metadata": {"version": "2.1"}
-  }'
-```
-
----
-
-## Debug Retrieval
-
-```bash
-curl -X POST http://localhost:8000/search \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "acme",
-    "query": "What is the refund policy?",
-    "top_k": 5
-  }'
-```
-
-Response includes ranked chunks with `score`, `chunk_id`, `doc_id`, and full `content`.
-
----
-
-## Chat (SSE Streaming)
-
-```bash
-curl -N -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "acme",
-    "query": "What is the refund policy for digital products?",
-    "top_k": 5
-  }'
-```
-
-Example event stream:
-```
-data: {"type": "token", "content": "Digital"}
-data: {"type": "token", "content": " products"}
-data: {"type": "token", "content": " are"}
-...
-data: {"type": "citations", "citations": [
-  {"rank": 1, "doc_id": "acme_a1b2", "chunk_id": "acme_a1b2_0003",
-   "score": 0.8821, "snippet": "Digital products are non-refundable once downloaded…"}
-]}
-data: [DONE]
-```
-
-When the context does not contain an answer:
-```
-data: {"type": "token", "content": "I don't have enough information …"}
-data: {"type": "citations", "citations": []}
-data: [DONE]
-```
-
----
-
-## Feedback
-
-```bash
-curl -X POST http://localhost:8000/feedback \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "acme",
-    "query": "What is the refund policy?",
-    "rating": 5,
-    "comment": "Perfect answer",
-    "conversation_id": "conv_xyz"
-  }'
-```
-
-Feedback is appended to `data/feedback.jsonl`.
-
----
-
-## Observability
-
-### Prometheus metrics
-
-```bash
-curl http://localhost:8000/metrics
-```
-
-Key metrics:
-
-| Metric | Description |
-|--------|-------------|
-| `http_requests_total` | Request count by method/endpoint/status |
-| `http_request_duration_seconds` | Request latency histogram |
-| `rag_retrieval_latency_ms` | Embed + Qdrant search latency |
-| `rag_llm_latency_ms` | LLM time-to-last-token |
-| `rag_tokens_in_total` | Prompt tokens sent to LLM |
-| `rag_tokens_out_total` | Completion tokens received |
-| `rag_cache_hit_total` | Embedding cache hits |
-| `rag_cache_miss_total` | Embedding cache misses |
-| `rag_no_answer_total` | No-answer responses |
-| `rag_retrieval_top_score` | Top cosine score histogram |
-| `rag_ingest_chunks_total` | Chunks upserted |
-
-### Structured JSON logs
-
-Every log line is a JSON object:
-```json
-{
-  "ts": "2025-01-15T10:23:45.123Z",
-  "level": "INFO",
-  "logger": "app.rag.retrieval",
-  "msg": "Retrieval done",
-  "request_id": "a3f1…",
-  "tenant_id": "acme",
-  "n_results": 5,
-  "top_score": 0.8821,
-  "latency_ms": 142.3
-}
-```
-
----
-
-## Evaluation
-
-The evaluation script measures retrieval quality against a golden dataset
-(no LLM call required – pure retrieval evaluation).
-
-### Golden dataset format (`data/eval/golden.jsonl`)
-
-```jsonl
-{"query": "What is the refund policy?", "relevant_chunk_ids": ["doc_001_0002"], "relevant_doc_ids": ["doc_001"]}
-{"query": "How do I reset my password?", "relevant_doc_ids": ["doc_002"]}
-```
-
-- `relevant_chunk_ids` takes precedence over `relevant_doc_ids` when both are present.
-- Either field may be omitted; the other is used as fallback.
-
-### Run evaluation
-
-```bash
-python -m app.eval.run \
-    --tenant acme \
-    --dataset data/eval/golden.jsonl \
-    --k 3 5 10
-```
-
-Example output:
-```
-Evaluating 50 queries | tenant=acme | k=[3, 5, 10]
-
-  [1/50] R@3=1.000  R@5=1.000  R@10=1.000  RR=1.000  | What is the refund policy?
-  [2/50] R@3=0.500  R@5=1.000  R@10=1.000  RR=0.333  | How do I reset my password?
-  …
-
-────────────────────────────────────────────────
-  METRIC                     VALUE
-────────────────────────────────────────────────
-  Recall@3                  0.7640
-  Recall@5                  0.8420
-  Recall@10                 0.9100
-  HitRate@3                 0.8200
-  HitRate@5                 0.8800
-  HitRate@10                0.9400
-  MRR                       0.7213
-  Queries evaluated             50
-────────────────────────────────────────────────
-
-  Report saved → reports/eval_acme_1736940000.json
-```
+Set `OLLAMA_BASE_URL=http://localhost:11434` in `.env` when running outside Docker Compose.
 
 ---
 
@@ -353,87 +146,135 @@ pip install -e ".[dev]"
 pytest -v
 ```
 
-Tests run without a live Qdrant instance or OpenAI API key (both are mocked).
+Tests run without a live Qdrant instance, embedding model, or LLM — all three are replaced by mocks in `tests/conftest.py`.
 
 ---
 
 ## Configuration Reference
 
-All configuration is via environment variables (or `.env`).
+All settings are read from environment variables (or `.env`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EMBEDDINGS_PROVIDER` | `local` | `local` or `openai` |
-| `EMBEDDINGS_LOCAL_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model ID (local provider) |
-| `OPENAI_API_KEY` | — | Required for `/chat`; also required when `EMBEDDINGS_PROVIDER=openai` |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model (openai provider) |
-| `OPENAI_EMBEDDING_DIMENSIONS` | `1536` | Must match the model's native dimension (openai provider) |
-| `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | Chat completion model |
-| `OPENAI_MAX_TOKENS` | `1024` | Max tokens in LLM response |
-| `OPENAI_TEMPERATURE` | `0.0` | LLM temperature (0 = deterministic) |
+| **Embeddings** | | |
+| `EMBEDDINGS_PROVIDER` | `local` | `local` (sentence-transformers) or `openai` |
+| `EMBEDDINGS_LOCAL_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model ID (384-dim, ≈ 90 MB) |
+| **LLM** | | |
+| `LLM_PROVIDER` | `openai` | `ollama` (local, no key) or `openai` (requires key) |
+| `OLLAMA_BASE_URL` | `http://ollama:11434` | Ollama server URL (`http://localhost:11434` outside Docker) |
+| `OLLAMA_MODEL` | `qwen2.5:7b-instruct` | Model to use; must be pulled first |
+| `OLLAMA_TEMPERATURE` | `0.2` | Sampling temperature for Ollama |
+| `OPENAI_API_KEY` | — | Required only when `LLM_PROVIDER=openai` or `EMBEDDINGS_PROVIDER=openai` |
+| `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | OpenAI chat model |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
+| `OPENAI_EMBEDDING_DIMENSIONS` | `1536` | Must match the model's native output dimension |
+| `OPENAI_MAX_TOKENS` | `1024` | Max completion tokens |
+| `OPENAI_TEMPERATURE` | `0.0` | OpenAI sampling temperature |
+| **Qdrant** | | |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant HTTP endpoint |
-| `QDRANT_API_KEY` | — | Optional Qdrant API key |
-| `QDRANT_COLLECTION_NAME` | `rag_chunks` | Collection for all tenants |
-| `CHUNK_SIZE` | `512` | Target tokens per chunk |
-| `CHUNK_OVERLAP` | `64` | Overlap tokens between chunks |
-| `RETRIEVAL_TOP_K` | `5` | Default number of chunks to retrieve |
-| `SIMILARITY_THRESHOLD` | `0.30` | Minimum cosine score (0 = no filter) |
-| `EMBEDDING_BATCH_SIZE` | `64` | Texts per OpenAI embeddings API call |
+| `QDRANT_API_KEY` | — | Optional; leave blank for unauthenticated Qdrant |
+| `QDRANT_COLLECTION_NAME` | `rag_chunks` | All tenants share this collection |
+| **RAG** | | |
+| `CHUNK_SIZE` | `512` | Target chunk size in tokens (tiktoken cl100k\_base) |
+| `CHUNK_OVERLAP` | `64` | Token overlap between consecutive chunks |
+| `RETRIEVAL_TOP_K` | `5` | Default number of chunks returned by `/search` and `/chat` |
+| `SIMILARITY_THRESHOLD` | `0.30` | Minimum cosine score; set `0.0` to disable |
+| `EMBEDDING_BATCH_SIZE` | `64` | Texts embedded per model/API call |
 | `EMBEDDING_CACHE_MAX_SIZE` | `10000` | In-process LRU cache capacity |
-| `FEEDBACK_LOG_PATH` | `data/feedback.jsonl` | Feedback JSONL file path |
-| `LOG_LEVEL` | `INFO` | Logging level |
+| **Service** | | |
+| `FEEDBACK_LOG_PATH` | `data/feedback.jsonl` | Feedback append log |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ---
 
-## Design Trade-offs & Notes
+## Evaluation CLI
 
-### Multi-tenancy
-All tenants share a single Qdrant collection.  Tenant isolation is enforced by
-a mandatory `tenant_id` payload filter on every query.  This keeps operations
-simple and avoids per-tenant collection provisioning overhead.  The trade-off
-is that a single tenant with millions of vectors can slow searches for other
-tenants; for extreme multi-tenancy consider sharding by tenant.
+Measures retrieval quality against a golden dataset (no LLM call required).
 
-### Chunking strategy
-Documents are chunked using tiktoken (cl100k\_base) for accurate token counts.
-Markdown ATX headers (`# … ######`) are detected and used as primary split
-points so each chunk retains its section heading for context.  A configurable
-token overlap prevents information loss at boundaries.
+**Golden dataset** (`data/eval/golden.jsonl`):
 
-### Embedding cache
-The in-process LRU cache avoids redundant API calls when the same content is
-re-ingested.  It is intentionally process-local (no Redis) so each replica
-is stateless.  Cache hit rate is exposed via `rag_cache_hit_total`.
+```jsonl
+{"query": "What is the refund policy?", "relevant_chunk_ids": ["demo_3a9f12b84c01_0000"], "relevant_doc_ids": ["demo_3a9f12b84c01"]}
+{"query": "How do I reset my password?", "relevant_doc_ids": ["demo_7e2a4108cd99"]}
+```
 
-### LLM provider interface
-`LLMProvider` is an abstract base class.  `OpenAIProvider` and
-`OllamaProvider` are the two built-in implementations.
-`OllamaProvider` uses the `/api/chat` endpoint with line-by-line JSON
-streaming; if Ollama is unreachable it raises `RuntimeError`, which
-`stream_rag_response` catches and forwards as an SSE `{"type":"error"}`
-event so the client always receives a terminated stream.
-To add Anthropic Claude: subclass `LLMProvider`, implement `stream_chat`
-and `chat`, and extend `get_llm_provider` to handle `LLM_PROVIDER=anthropic`.
+`relevant_chunk_ids` takes precedence when present; `relevant_doc_ids` is used as fallback.
 
-### Similarity threshold
-`SIMILARITY_THRESHOLD=0.30` is a conservative default.  If your embeddings
-cluster tightly you may want to raise it.  Setting it to `0.0` disables
-filtering.  The eval script defaults to `0.0` so retrieval is evaluated at
-full recall.
+```bash
+python -m app.eval.run \
+  --tenant demo \
+  --dataset data/eval/golden.jsonl \
+  --k 3 5 10 \
+  --output-dir reports
+```
 
-### Deduplication and deterministic doc IDs
-`doc_id` is derived from `SHA-1(file_bytes)[:12]` prefixed by `tenant_id`,
-so re-ingesting the same file bytes always returns the same `doc_id`
-regardless of filename or server path.  Copying a file to a different folder
-and re-ingesting it still deduplicates against the original.
-Chunk-level deduplication by `(chunk_hash, tenant_id)` remains unchanged —
-re-ingesting an unchanged file inserts zero new chunks.
+Reports are saved to `reports/eval_{tenant}_{unix_timestamp}.json`.
 
-### Qdrant Query Points API
-We use `AsyncQdrantClient.query_points()` instead of the deprecated
-`search()` method.  The response is normalized by `_extract_points()` in
-`qdrant_store.py` which handles shape differences across qdrant-client
-versions (`response.points`, `response.result.points`, or a plain list).
-`query_points` is also the foundation for future hybrid / multi-stage
-queries (sparse + dense, re-ranking) that the old `search()` path did not
-support.
+---
+
+## Troubleshooting
+
+**Qdrant vector dimension mismatch**
+`Collection was created with dimension X, got Y` — this happens when you switch embedding providers after a collection already exists.
+
+```bash
+# Option A: use a fresh collection name
+echo "QDRANT_COLLECTION_NAME=rag_chunks_v2" >> .env
+
+# Option B: wipe the volume and restart
+docker compose down -v && docker compose up -d
+```
+
+**Port already in use**
+Edit the host-side port mapping in `docker-compose.yml` (e.g. `"8020:8000"`) and restart.
+
+**Ollama model not found / LLM unavailable**
+If `/chat` returns `"LLM unavailable — here are the most relevant sources found."` in the token stream:
+- The Ollama model was not pulled yet: `docker exec -it rag-service-ollama-1 ollama pull qwen2.5:7b-instruct`
+- Or the Ollama container is still starting; wait a few seconds and retry.
+- The `citations` event in the response still contains the retrieved sources.
+
+**OpenAI rate limit or auth error**
+Same graceful fallback as above — the response stream returns sources even when the LLM call fails. Fix the API key in `.env` and restart the API container.
+
+---
+
+## Architecture
+
+The service is stateless (no session storage) and multi-tenant. All tenants share a single Qdrant collection; isolation is enforced by a mandatory `tenant_id` payload filter on every query. Documents are chunked with tiktoken (`cl100k_base`) and a markdown-header-aware splitter so each chunk retains its section heading. The embedding cache (`LRU`, per-process) avoids redundant model/API calls on re-ingest. The LLM layer is abstracted behind `LLMProvider`; adding a new backend means subclassing it and registering it in `get_llm_provider()`.
+
+**Ingest pipeline:**
+1. Receive file bytes → compute `doc_id = {tenant_id}_{sha1[:12]}`
+2. Chunk text (token-window + markdown sections)
+3. Embed chunks (local sentence-transformers or OpenAI)
+4. Dedup by `(chunk_hash, tenant_id)` → upsert new chunks to Qdrant
+
+**Query pipeline:**
+1. Embed query → `query_points()` against Qdrant with tenant filter
+2. Format retrieved chunks as anonymous `[S1] … [S2] …` sources
+3. Stream LLM response token-by-token (buffered into word/phrase frames)
+4. Emit `citations` event with full metadata → emit `[DONE]`
+
+---
+
+## Feedback
+
+```bash
+curl -X POST http://localhost:8010/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "demo",
+    "query": "What is the refund policy?",
+    "rating": 5,
+    "comment": "Correct and concise."
+  }'
+# HTTP 204 No Content
+```
+
+Feedback is appended to `FEEDBACK_LOG_PATH` (default `data/feedback.jsonl`).
+
+---
+
+## License
+
+No LICENSE file is present in this repository. Add one before making it public (e.g. `MIT`, `Apache-2.0`).
